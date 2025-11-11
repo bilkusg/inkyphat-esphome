@@ -1,0 +1,203 @@
+# Please modify as necessary 
+# The mandatory platform
+esphome:
+  name: inkyphat-esp # change this as desired
+
+# set up your board here
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  framework:
+    type: esp-idf # important use the esp-idf framework
+    #sdkconfig_options:
+      #CONFIG_ESP_TASK_WDT_TIMEOUT_S: "60"
+
+# Enable logging or not as required
+logger:
+  level: DEBUG
+
+# Enable Home Assistant API
+api:
+  on_client_connected:
+    then:
+      - logger.log: 
+          format: "Client %s now connected to API with IP %s"
+          args: ["client_info.c_str()", "client_address.c_str()"]
+
+# Allow Over-The-Air updates
+ota:
+- platform: esphome
+
+# Configure wifi for your setup
+wifi:
+  ssid: yourssid
+  password: yourpassword
+  fast_connect: true # if it works
+
+# This allows us to find the custom component in a subdirectory of the yaml file location called external_components/inkyphat_epaper
+# You can change it as required
+external_components:
+  - source:
+      type: local
+      path: external_components
+    components:
+      - inkyphat_epaper
+    refresh: always
+
+spi: # used by display
+  clk_pin: GPIO18 # set up as required for your board`
+  mosi_pin: GPIO23 # 
+# Define the display - check the GPIO pins
+# The sample lambda displays two rows of text from homeassistant in helper text strings called Inky1 and Inky2
+display:
+  - platform: inkyphat_epaper
+    auto_clear_enabled: false
+    id: eink
+    cs_pin: GPIO19 
+    dc_pin: GPIO20 
+    busy_pin: GPIO21 
+    reset_pin: GPIO22 
+    model: 2.13inv2 
+    rotation: 90
+    update_interval:  never 
+    full_update_every: 1
+    # Set up the content to display
+    lambda: |-
+      it.clear();
+      it.printf(0,20, id(font_medium), id(red),"%.20s",id(Inky1).state.c_str());
+      it.printf(0,40, id(font_medium), "%.20s",id(Inky2).state.c_str());
+
+      
+# Some examples of obtaining text data from homeassistant
+# You can do whatever you want here
+  - name: Inky1
+    platform: homeassistant
+    id: Inky1
+    entity_id: input_text.Inky1
+    internal: true
+    on_value:
+      then:
+        - logger.log:
+            format: "Inky1 update received %d"
+            args: ["id(ready_to_update)"]
+        - script.execute: update_required
+      
+
+  - name: Inky2
+    platform: homeassistant
+    id: Inky2
+    entity_id: input_text.Inky2
+    internal: true
+    on_value:
+      then:
+        - logger.log:
+            format: "Inky2 update received %d"
+            args: ["id(ready_to_update)"]
+        - script.execute: update_required
+
+# This sensor obtains a number from homeassistant which is used to control how long the board goes into deep sleep between updates
+
+sensor:
+  - name: InkySuspendMins
+    platform: homeassistant
+    id: InkySuspendMins
+    entity_id: input_number.InkySuspendMins
+    internal: true
+    on_value:
+      then:
+        - logger.log:
+            format: "Inky Suspend time received"
+        - script.execute: update_required
+        - delay: 1s
+
+globals:
+  - id: ready_to_update
+    type: int
+    restore_value: no
+    initial_value: "-2" # set this to 1 more than minus the number of different homeassistant values we need to obtain 3 in our case
+  - id: more_to_do
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: already_dealt_with
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+# Define your fonts
+font:
+  - file: "arial.ttf"
+    id: font_small
+    size: 14
+  - file: "arial.ttf"
+    id: font_medium
+    size: 20
+  - file: "arial.ttf"
+    id: font_large
+    size: 30
+
+# Define colors for the 3-color display
+color:
+  - id: red
+    red: 100%
+    green: 0%
+    blue: 0%
+# setup deep sleep 
+deep_sleep:
+    run_duration: 20min
+    sleep_duration: 1s
+    id: deepsleep1
+
+# Don't mess with these scripts unless you understand them
+script:
+  - id: update_required
+    mode: queued
+    max_runs: 0
+    then:
+      - lambda: "id(more_to_do) = id(more_to_do) + 1;"
+      - script.execute: update_process
+  - id: update_process
+    mode: queued
+    max_runs: 2
+    then:
+      - logger.log: 
+          format: "Update received - processing %d"
+          args: ["id(ready_to_update)"]
+      - lambda: "id(ready_to_update) = id(ready_to_update) + 1;"
+      - if: 
+          condition:
+            lambda: 'return id(ready_to_update) > 0;'
+          then:
+              - delay: 2 s # should allow any pending updates to trigger
+              - lambda: "id(already_dealt_with) = id(more_to_do); id(ready_to_update) = 0;"
+              #- lambda: |-
+                  #bool isbusy = id(eink).isBusy(); 
+                  #if (isbusy) {
+                    #ESP_LOGI("lambda","isbusy true");
+                  #} else {
+                    #ESP_LOGI("lambda","isbusy false");
+                  #}
+              # - logger.log: "update display now"
+              - component.update: eink
+              # - logger.log: "update display commands sent"
+              -  wait_until: 
+                   condition:
+                     lambda:  "return (!id(eink).isBusy());" 
+              # - logger.log: "update display action completed"
+              - if: 
+                  condition:
+                    lambda: 'return ((id(InkySuspendMins).state > 0.01) && (id(already_dealt_with) == id(more_to_do)));'
+                  then:
+                    - logger.log: "Will suspend now"
+                    - lambda: |-
+                       float minutes = id(InkySuspendMins).state;
+                       if (isnan(minutes) || minutes <= 0) { minutes=0; }
+                       id(deepsleep1).set_sleep_duration(minutes*60*1000);
+                    - deep_sleep.enter:
+                        id: deepsleep1
+                  else:
+                    - logger.log: 
+                         format: "Not suspending - to do:%d, dealt with:%d"
+                         args: ["id(more_to_do)","id(already_dealt_with)"]
+          else:
+            - logger.log: "Not updating display yet"
